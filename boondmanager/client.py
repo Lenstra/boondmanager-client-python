@@ -26,11 +26,15 @@ logger = logging.getLogger(__name__)
 
 from . import spec
 from .api import BoondManagerAPI
-from .jsonapi import Document
+from .jsonapi import Document, Entity
 from .models import (
     AbsencesReport,
+    Company,
     CreateAbsencePeriod,
     CurrentUser,
+    Positioning,
+    Project,
+    ProjectSummary,
     Resource,
     TimesReport,
     WorkUnitType,
@@ -154,6 +158,7 @@ class BoondManagerClient:
         self._base_url = base_url.rstrip("/")
         self._http = httpx.AsyncClient(timeout=30.0)
         self._semaphore = semaphore
+        self._resource_type_dict: dict[str, int] | None = None
         self.api = BoondManagerAPI(self)
 
     async def aclose(self) -> None:
@@ -291,23 +296,218 @@ class BoondManagerClient:
         """GET /application/dictionary — work unit types, states, etc."""
         return await self.request("GET", "/application/dictionary")
 
+    async def get_resource_type_dictionary(self) -> dict[str, int]:
+        """Resource-type labels -> ids (``setting.typeOf.resource``).
+
+        Fetched once per client instance via ``get_dictionary()`` and cached
+        for the instance's lifetime (no TTL). Missing labels are a plain
+        dict ``.get()`` miss — validating the customer's dictionary
+        configuration is the caller's business.
+        """
+        if self._resource_type_dict is None:
+            self._resource_type_dict = self._parse_resource_types(
+                await self.get_dictionary()
+            )
+        return self._resource_type_dict
+
+    @staticmethod
+    def _parse_resource_types(raw: dict) -> dict[str, int]:
+        # Confirmed against a live instance (2026-07-10): "data" is the
+        # settings object directly, no JSON:API "attributes" wrapper.
+        data = raw.get("data")
+        entries = None
+        if isinstance(data, dict):
+            entries = ((data.get("setting") or {}).get("typeOf") or {}).get("resource")
+        if not isinstance(entries, list):
+            raise BoondManagerError(
+                "unexpected /application/dictionary response shape: "
+                "data.setting.typeOf.resource not found"
+            )
+        return {
+            str(e["value"]): int(e["id"])
+            for e in entries
+            if isinstance(e, dict) and "id" in e and "value" in e
+        }
+
     # ------------------------------------------------------------------
     # Resources
     # ------------------------------------------------------------------
 
+    _MANAGER_FIELDS = (("mainManager", "main_manager"), ("hrManager", "hr_manager"))
+    _EMAIL_FIELDS = ("email1", "email2", "email3")
+
+    async def _resource_with_managers(
+        self, item: dict, doc: Document, cache: dict[str, Resource | None]
+    ) -> Resource:
+        """Validate a resource item and resolve its manager relationships.
+
+        Resolution is exactly one level deep: managers fetched here are
+        validated directly, never passed back through this helper, so a
+        manager's own ``main_manager``/``hr_manager`` are always None.
+        ``cache`` deduplicates manager resolution (profile + email) within
+        one caller (id -> Resource, or None for a dangling 404 reference).
+        """
+        resource = Resource.model_validate(item)
+        for rel_name, field in self._MANAGER_FIELDS:
+            refs = Entity(item).rel(rel_name)
+            manager_id = str(refs[0].get("id", "")) if refs else ""
+            if not manager_id:
+                continue
+            if manager_id not in cache:
+                cache[manager_id] = await self._resolve_manager(manager_id, doc, resource.id, rel_name)
+            setattr(resource.attributes, field, cache[manager_id])
+        return resource
+
+    async def _resolve_manager(
+        self, manager_id: str, doc: Document, resource_id: str, rel_name: str
+    ) -> Resource | None:
+        included = doc.find("resource", manager_id)
+        if included is not None:
+            manager = Resource.model_validate(included.raw)
+        else:
+            try:
+                resp = await self.request("GET", f"/resources/{manager_id}")
+                manager = Resource.model_validate(self._item(resp))
+            except BoondManagerAPIError as exc:
+                if exc.status_code != 404:
+                    raise
+                logger.warning(
+                    "resource %s has dangling %s reference to resource %s (404)",
+                    resource_id, rel_name, manager_id,
+                )
+                return None
+        await self._fill_email(manager)
+        return manager
+
+    async def _fill_email(self, resource: Resource) -> None:
+        """GET /resources/{id}/information — the basic resource payload never
+        carries email1/2/3, they live on this sub-resource instead."""
+        try:
+            resp = await self.request("GET", f"/resources/{resource.id}/information")
+        except BoondManagerAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            logger.warning(
+                "could not fetch /resources/%s/information for email (404)", resource.id
+            )
+            return
+        attrs = self._item(resp).get("attributes") or {}
+        for field in self._EMAIL_FIELDS:
+            value = attrs.get(field)
+            if value:
+                setattr(resource.attributes, field, value)
+
     async def get_resource(self, resource_id: str) -> Resource:
-        """GET /resources/{id}"""
+        """GET /resources/{id}
+
+        ``mainManager``/``hrManager`` relationships are always resolved to
+        full ``Resource`` objects, including their email (via one extra GET
+        to ``/resources/{id}/information``, since the basic payload never
+        carries emails), on top of the profile itself (from the response's
+        ``included`` data when present, otherwise one extra GET). A dangling
+        manager reference (404) is logged and resolves to None.
+        """
         resp = await self.request("GET", f"/resources/{resource_id}")
-        return Resource.model_validate(self._item(resp))
+        return await self._resource_with_managers(self._item(resp), Document(resp), {})
 
     async def search_resources_by_email(self, email: str) -> list[Resource]:
-        """GET /resources?keywords=<email>&keywordsType=emails"""
+        """GET /resources?keywords=<email>&keywordsType=emails
+
+        Each returned resource gets the same manager resolution as
+        ``get_resource``, so N results can cost up to 4N extra calls
+        (managers shared between results are resolved once).
+        """
         resp = await self.request(
             "GET",
             "/resources",
             params={"keywords": email, "keywordsType": "emails"},
         )
-        return [Resource.model_validate(r) for r in self._list(resp)]
+        doc = Document(resp)
+        cache: dict[str, Resource | None] = {}
+        return [
+            await self._resource_with_managers(r, doc, cache)
+            for r in self._list(resp)
+        ]
+
+    # ------------------------------------------------------------------
+    # Positionings, projects, companies
+    # ------------------------------------------------------------------
+
+    async def get_resource_positionings(self, resource_id: str) -> list[Positioning]:
+        """GET /resources/{id}/positionings — the resource's staffing assignments.
+
+        A positioning has no direct relationship to a project (it relates to
+        an opportunity instead); use get_resource_projects() to get a
+        resource's projects.
+        """
+        doc = await self.api.resources.positionings(resource_id)
+        return [
+            Positioning(
+                id=e.id,
+                start_date=e.get("startDate"),
+                end_date=e.get("endDate"),
+            )
+            for e in doc.many
+        ]
+
+    async def get_resource_projects(self, resource_id: str) -> list[ProjectSummary]:
+        """GET /resources/{id}/projects — the resource's project assignments.
+
+        Use ``reference`` as the display name: BoondManager does not
+        populate ``title`` on this endpoint.
+        """
+        doc = await self.api.resources.projects(resource_id)
+        return [
+            ProjectSummary(
+                id=e.id,
+                title=e.get("title"),
+                reference=e.get("reference"),
+                state=e.get("state"),
+            )
+            for e in doc.many
+        ]
+
+    async def get_project(self, project_id: str) -> Project:
+        """GET /projects/{id}
+
+        The ``company`` relationship is resolved to a ``Company`` (from
+        ``included`` data when present, otherwise one extra GET). Projects
+        without a linked company return ``company=None``; so does a dangling
+        company reference (404, logged).
+        """
+        doc = await self.api.projects.get(project_id)
+        entity = doc.one
+        company: Company | None = None
+        refs = entity.rel("company")
+        company_id = str(refs[0].get("id", "")) if refs else ""
+        if company_id:
+            included = doc.find("company", company_id)
+            if included is not None:
+                company = Company(id=included.id, name=included.get("name") or "")
+            else:
+                try:
+                    company = await self.get_company(company_id)
+                except BoondManagerAPIError as exc:
+                    if exc.status_code != 404:
+                        raise
+                    logger.warning(
+                        "project %s has dangling company reference to %s (404)",
+                        entity.id, company_id,
+                    )
+        return Project(
+            id=entity.id,
+            title=entity.get("title"),
+            reference=entity.get("reference"),
+            state=entity.get("state"),
+            start_date=entity.get("startDate"),
+            end_date=entity.get("endDate"),
+            company=company,
+        )
+
+    async def get_company(self, company_id: str) -> Company:
+        """GET /companies/{id}"""
+        doc = await self.api.companies.get(company_id)
+        return Company(id=doc.one.id, name=doc.one.get("name") or "")
 
     # ------------------------------------------------------------------
     # Times reports

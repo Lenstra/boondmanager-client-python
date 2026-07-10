@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -391,6 +392,81 @@ class CreateAbsencePeriod(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Companies, positionings, projects
+# ---------------------------------------------------------------------------
+#
+# Flat models (no id/attributes split): their fields mix JSON:API attributes,
+# relationships, and included data, so client code assembles them from
+# Document/Entity navigation instead of validating a raw item directly.
+
+
+class Company(BaseModel):
+    model_config = _CFG
+
+    id: str
+    name: str = ""
+
+
+class Positioning(BaseModel):
+    """A staffing assignment period for a resource.
+
+    Confirmed against a live instance (2026-07-10): a positioning has no
+    "project" relationship. It relates to an "opportunity" (and a "dependsOn"
+    back-reference to the resource itself), not directly to a project. To get
+    a resource's projects, use get_resource_projects() instead.
+    """
+
+    model_config = _CFG
+
+    id: str
+    start_date: date | None = Field(default=None, alias="startDate")
+    end_date: date | None = Field(default=None, alias="endDate")
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _empty_date(cls, v):
+        return v or None
+
+
+class ProjectSummary(BaseModel):
+    """Lightweight project as returned by list endpoints.
+
+    "title" is not populated by BoondManager on the live payloads checked
+    (2026-07-10): use "reference" as the display name.
+    """
+
+    model_config = _CFG
+
+    id: str
+    title: str | None = None
+    reference: str | None = None
+    state: int | str | None = None
+
+
+class Project(BaseModel):
+    """Full project detail, with its client company when one is linked.
+
+    "title" and "state" are not populated by BoondManager on the live
+    payloads checked (2026-07-10): use "reference" as the display name.
+    """
+
+    model_config = _CFG
+
+    id: str
+    title: str | None = None
+    reference: str | None = None
+    state: int | str | None = None
+    start_date: date | None = Field(default=None, alias="startDate")
+    end_date: date | None = Field(default=None, alias="endDate")
+    company: Company | None = None
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _empty_date(cls, v):
+        return v or None
+
+
+# ---------------------------------------------------------------------------
 # Resources
 # ---------------------------------------------------------------------------
 
@@ -406,6 +482,12 @@ class ResourceAttributes(BaseModel):
     state: int | None = None
     type_of: int | None = Field(default=None, alias="typeOf")
     title: str | None = None
+    # Managers come from JSON:API relationships, not attributes, so
+    # model_validate never fills them: client.get_resource() resolves and
+    # assigns them (exactly one level deep — a manager's own managers stay
+    # None).
+    main_manager: Resource | None = Field(default=None, alias="mainManager")
+    hr_manager: Resource | None = Field(default=None, alias="hrManager")
 
     @property
     def full_name(self) -> str:
@@ -427,6 +509,17 @@ class Resource(BaseModel):
     @property
     def full_name(self) -> str:
         return self.attributes.full_name
+
+    @property
+    def main_manager(self) -> Resource | None:
+        return self.attributes.main_manager
+
+    @property
+    def hr_manager(self) -> Resource | None:
+        return self.attributes.hr_manager
+
+
+ResourceAttributes.model_rebuild()
 
 
 # ---------------------------------------------------------------------------
