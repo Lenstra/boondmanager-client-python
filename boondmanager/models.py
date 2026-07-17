@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from datetime import date
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+logger = logging.getLogger(__name__)
 
 _CFG = ConfigDict(populate_by_name=True, extra="ignore")
 
@@ -407,7 +410,31 @@ class Company(BaseModel):
     name: str = ""
 
 
-class Positioning(BaseModel):
+class _EmptyDateMixin:
+    """Shared before-validator for start_date/end_date: empty or unparseable
+    date strings become None instead of failing validation.
+
+    BoondManager occasionally sends a sentinel-like malformed date string for
+    "no date set" instead of omitting the field or sending "" (the only shape
+    handled by a plain falsy check). A genuinely different, non-date-shaped
+    payload still raises -- only date-shaped-but-unparseable strings degrade.
+    """
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _empty_date(cls, v):
+        if not v:
+            return None
+        if isinstance(v, str):
+            try:
+                date.fromisoformat(v)
+            except ValueError:
+                logger.warning("%s: unparseable date %r, coercing to None", cls.__name__, v)
+                return None
+        return v
+
+
+class Positioning(_EmptyDateMixin, BaseModel):
     """A staffing assignment period for a resource.
 
     Confirmed against a live instance (2026-07-10): a positioning has no
@@ -421,11 +448,6 @@ class Positioning(BaseModel):
     id: str
     start_date: date | None = Field(default=None, alias="startDate")
     end_date: date | None = Field(default=None, alias="endDate")
-
-    @field_validator("start_date", "end_date", mode="before")
-    @classmethod
-    def _empty_date(cls, v):
-        return v or None
 
 
 class ProjectSummary(BaseModel):
@@ -443,7 +465,7 @@ class ProjectSummary(BaseModel):
     state: int | str | None = None
 
 
-class Project(BaseModel):
+class Project(_EmptyDateMixin, BaseModel):
     """Full project detail, with its client company when one is linked.
 
     "title" and "state" are not populated by BoondManager on the live
@@ -459,11 +481,6 @@ class Project(BaseModel):
     start_date: date | None = Field(default=None, alias="startDate")
     end_date: date | None = Field(default=None, alias="endDate")
     company: Company | None = None
-
-    @field_validator("start_date", "end_date", mode="before")
-    @classmethod
-    def _empty_date(cls, v):
-        return v or None
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +505,23 @@ class ResourceAttributes(BaseModel):
     # None).
     main_manager: Resource | None = Field(default=None, alias="mainManager")
     hr_manager: Resource | None = Field(default=None, alias="hrManager")
+
+    @field_validator("main_manager", "hr_manager", mode="before")
+    @classmethod
+    def _tolerant_manager(cls, v):
+        # These fields only exist for the client to populate post-validation
+        # (see above); a caller passing raw "mainManager"/"hrManager" data
+        # through model_validate previously had it silently ignored
+        # (extra="ignore", no such field). Keep that behavior for anything
+        # that isn't already a resolved Resource, rather than a hard
+        # ValidationError.
+        if v is None or isinstance(v, Resource):
+            return v
+        try:
+            return Resource.model_validate(v)
+        except ValidationError:
+            logger.warning("%s: ignoring unresolvable manager value %r", cls.__name__, v)
+            return None
 
     @property
     def full_name(self) -> str:

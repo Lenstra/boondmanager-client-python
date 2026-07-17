@@ -68,7 +68,10 @@ carries emails — up to 4 extra GETs per resource, up to 4N for a search
 returning N results, though managers shared between results are only
 resolved once per call. A dangling manager reference or a failed email
 fetch (404) is logged and resolves to `None`/no email rather than failing
-the whole call.
+the whole call. That resolution runs concurrently, so the client caps
+itself at 5 requests in flight at once by default — pass
+`max_concurrent_requests=` to change it, or `semaphore=` to share one limit
+across multiple client instances.
 
 `api.ENDPOINT_INDEX` maps `("PUT", "/times-reports/{id}")` to
 `("times_reports", "update")` for programmatic discovery, and

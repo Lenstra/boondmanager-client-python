@@ -13,15 +13,18 @@ from boondmanager.exceptions import BoondManagerAPIError, BoondManagerError
 def make_client(responses: dict) -> BoondManagerClient:
     """Fake client whose request() serves canned responses keyed by endpoint.
 
-    A value that is an Exception instance is raised instead of returned.
-    Every call is recorded in ``client.calls`` for call-count assertions.
+    A value that is an Exception instance is raised instead of returned. A
+    list value is a queue of successive responses for repeated calls to that
+    endpoint (e.g. one entry per pagination page). Every call is recorded in
+    ``client.calls`` for call-count assertions.
     """
     client = BoondManagerClient(client_token="t", client_key="k")
     client.calls = []
+    iterators = {k: iter(v) for k, v in responses.items() if isinstance(v, list)}
 
     async def fake_request(method, endpoint, **kwargs):
         client.calls.append((method, endpoint, kwargs.get("params")))
-        resp = responses[endpoint]
+        resp = next(iterators[endpoint]) if endpoint in iterators else responses[endpoint]
         if isinstance(resp, Exception):
             raise resp
         return resp
@@ -85,12 +88,28 @@ def test_get_resource_positionings_returns_dates():
     assert positionings[0].start_date == date(2026, 1, 1)
     assert positionings[0].end_date == date(2026, 6, 30)
     assert positionings[1].end_date is None  # empty string coerced to None
-    assert client.calls == [("GET", "/resources/123/positionings", None)]
+    assert client.calls == [
+        ("GET", "/resources/123/positionings", {"page": 1, "maxResults": 30})
+    ]
 
 
 def test_get_resource_positionings_empty():
     client = make_client({"/resources/123/positionings": {"data": []}})
     assert asyncio.run(client.get_resource_positionings("123")) == []
+
+
+def test_get_resource_positionings_paginates_past_default_page_size():
+    page1 = {
+        "data": [
+            {"id": str(i), "type": "positioning", "attributes": {}}
+            for i in range(30)
+        ]
+    }
+    page2 = {"data": [{"id": "30", "type": "positioning", "attributes": {}}]}
+    client = make_client({"/resources/123/positionings": [page1, page2]})
+    positionings = asyncio.run(client.get_resource_positionings("123"))
+    assert [p.id for p in positionings] == [str(i) for i in range(31)]
+    assert [c[2]["page"] for c in client.calls] == [1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +146,20 @@ def test_get_resource_projects_returns_summaries():
 def test_get_resource_projects_empty():
     client = make_client({"/resources/123/projects": {"data": []}})
     assert asyncio.run(client.get_resource_projects("123")) == []
+
+
+def test_get_resource_projects_paginates_past_default_page_size():
+    page1 = {
+        "data": [
+            {"id": f"P{i}", "type": "project", "attributes": {"reference": f"R{i}"}}
+            for i in range(30)
+        ]
+    }
+    page2 = {"data": [{"id": "P30", "type": "project", "attributes": {"reference": "R30"}}]}
+    client = make_client({"/resources/123/projects": [page1, page2]})
+    projects = asyncio.run(client.get_resource_projects("123"))
+    assert [p.id for p in projects] == [f"P{i}" for i in range(31)]
+    assert [c[2]["page"] for c in client.calls] == [1, 2]
 
 
 def test_get_resource_projects_title_absent_is_none():
@@ -224,6 +257,15 @@ def test_get_project_dangling_company_resolves_to_none():
     )
     project = asyncio.run(client.get_project("P1"))
     assert project.company is None
+
+
+def test_get_project_malformed_company_ref_does_not_crash():
+    # A relationship ref that isn't a {"id", "type"} dict (e.g. a bare
+    # string) must degrade to company=None rather than crash on .get().
+    client = make_client({"/projects/P1": {"data": _project_item({"data": "not-a-dict"})}})
+    project = asyncio.run(client.get_project("P1"))
+    assert project.company is None
+    assert len(client.calls) == 1
 
 
 def test_get_project_404_propagates():
@@ -381,6 +423,17 @@ def test_get_resource_dangling_manager_404_is_swallowed():
     assert resource.main_manager is None
 
 
+def test_get_resource_malformed_manager_ref_does_not_crash():
+    # A relationship ref that isn't a {"id", "type"} dict (e.g. a bare
+    # string) must degrade to main_manager=None rather than crash on .get().
+    client = make_client(
+        {"/resources/123": {"data": _resource_item("123", {"mainManager": {"data": "not-a-dict"}})}}
+    )
+    resource = asyncio.run(client.get_resource("123"))
+    assert resource.main_manager is None
+    assert len(client.calls) == 1
+
+
 def test_get_resource_manager_fetch_non_404_propagates():
     client = make_client(
         {
@@ -459,7 +512,11 @@ def test_search_resources_by_email_params_and_models():
     resources = asyncio.run(client.search_resources_by_email("a@x.fr"))
     assert [r.id for r in resources] == ["1", "2"]
     assert client.calls == [
-        ("GET", "/resources", {"keywords": "a@x.fr", "keywordsType": "emails"})
+        (
+            "GET",
+            "/resources",
+            {"keywords": "a@x.fr", "keywordsType": "emails", "page": 1, "maxResults": 30},
+        )
     ]
 
 
@@ -488,6 +545,75 @@ def test_search_resources_shared_manager_fetched_once():
     # per-call cache dedupes the shared manager: profile and email each fetched once
     assert len([c for c in client.calls if c[1] == "/resources/77"]) == 1
     assert len([c for c in client.calls if c[1] == "/resources/77/information"]) == 1
+
+
+def test_search_resources_shared_manager_not_aliased():
+    # Each resource must get its own copy of the shared manager: mutating
+    # one resource's manager must not leak into another resource's.
+    client = make_client(
+        {
+            "/resources": {
+                "data": [
+                    _resource_item("1", {"mainManager": _rel("77")}),
+                    _resource_item("2", {"mainManager": _rel("77")}),
+                ]
+            },
+            "/resources/77": {"data": _resource_item("77")},
+            "/resources/77/information": _info_response("77", "manager77@lenstra.fr"),
+        }
+    )
+    r1, r2 = asyncio.run(client.search_resources_by_email("shared@lenstra.fr"))
+    assert r1.main_manager is not r2.main_manager
+    r1.main_manager.attributes.email1 = "mutated@example.com"
+    assert r2.main_manager.attributes.email1 == "manager77@lenstra.fr"
+
+
+def test_search_resources_by_email_paginates_and_dedupes_manager_across_pages():
+    page1 = {
+        "data": [_resource_item(str(i), {"mainManager": _rel("77")}) for i in range(30)]
+    }
+    page2 = {"data": [_resource_item("30", {"mainManager": _rel("77")})]}
+    client = make_client(
+        {
+            "/resources": [page1, page2],
+            "/resources/77": {"data": _resource_item("77")},
+            "/resources/77/information": _info_response("77", "manager77@lenstra.fr"),
+        }
+    )
+    resources = asyncio.run(client.search_resources_by_email("shared@lenstra.fr"))
+    assert [r.id for r in resources] == [str(i) for i in range(31)]
+    assert all(r.main_manager.id == "77" for r in resources)
+    # manager resolved once despite being referenced across two pages
+    assert len([c for c in client.calls if c[1] == "/resources/77"]) == 1
+    assert len([c for c in client.calls if c[1] == "/resources/77/information"]) == 1
+    assert [c[2]["page"] for c in client.calls if c[1] == "/resources"] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# ResourceAttributes.main_manager / hr_manager tolerant validation
+# ---------------------------------------------------------------------------
+
+
+def test_resource_attributes_tolerates_malformed_manager_value():
+    # These fields are only ever populated by client code post-validation;
+    # a caller passing raw, non-Resource-shaped data through model_validate
+    # (e.g. replaying a captured payload) must not get a hard ValidationError.
+    from boondmanager.models import ResourceAttributes
+
+    attrs = ResourceAttributes.model_validate(
+        {"firstName": "x", "mainManager": {"unexpected": "shape"}}
+    )
+    assert attrs.main_manager is None
+
+
+def test_resource_attributes_accepts_nested_resource_dict():
+    from boondmanager.models import ResourceAttributes
+
+    attrs = ResourceAttributes.model_validate(
+        {"firstName": "x", "mainManager": {"id": "77", "attributes": {"firstName": "Boss"}}}
+    )
+    assert attrs.main_manager.id == "77"
+    assert attrs.main_manager.attributes.first_name == "Boss"
 
 
 # ---------------------------------------------------------------------------
