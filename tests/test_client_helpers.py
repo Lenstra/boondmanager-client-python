@@ -4,8 +4,8 @@ import asyncio
 
 import pytest
 
-from boondmanager import BoondManagerClient
-from boondmanager.exceptions import BoondManagerError
+from boondmanager import BoondManagerClient, CreateAbsencePeriod
+from boondmanager.exceptions import BoondManagerError, BoondManagerSilentDropError
 from boondmanager.models import TimesReport
 
 
@@ -90,6 +90,207 @@ def test_create_times_report_posts_correct_body():
         "id": "42",
         "type": "resource",
     }
+
+
+def test_get_resource_times_reports_returns_summaries():
+    client = make_client(
+        {
+            "data": [
+                {
+                    "id": "100",
+                    "type": "timesreport",
+                    "attributes": {"term": "2026-06", "state": "validated", "closed": True},
+                },
+                {
+                    "id": "101",
+                    "type": "timesreport",
+                    "attributes": {"term": "2026-07", "state": "savedAndNoValidation"},
+                },
+            ]
+        }
+    )
+    reports = asyncio.run(client.get_resource_times_reports("42"))
+    assert [(r.id, r.term, r.is_editable) for r in reports] == [
+        ("100", "2026-06", False),
+        ("101", "2026-07", True),
+    ]
+    assert client.last_call == ("GET", "/resources/42/times-reports", None)
+
+
+_FULL_REPORT = {
+    "data": {
+        "id": "100",
+        "type": "timesreport",
+        "attributes": {
+            "term": "2026-06",
+            "state": "savedAndNoValidation",
+            "closed": False,
+            "regularTimes": [
+                {
+                    "id": "7",
+                    "startDate": "2026-06-01",
+                    "duration": 1.0,
+                    "row": 3,
+                    "workUnitType": {
+                        "reference": 1,
+                        "activityType": "production",
+                        "name": "Normale",
+                    },
+                    "project": {"id": "P1", "reference": "PRJ1"},
+                }
+            ],
+            "exceptionalTimes": [],
+            "absencesTimes": [],
+        },
+    },
+    "included": [{"id": "P1", "type": "project", "attributes": {"reference": "PRJ1"}}],
+}
+
+
+def test_get_times_report_full_detail():
+    client = make_client(_FULL_REPORT)
+    report = asyncio.run(client.get_times_report("100"))
+    assert report.term == "2026-06"
+    entries = report.attributes.regular_times
+    assert len(entries) == 1
+    assert entries[0].project.reference == "PRJ1"
+    assert entries[0].activity_name == "PRJ1"
+    assert [(row.name, row.total_days) for row in report.rows()] == [("PRJ1", 1.0)]
+
+
+def test_get_times_report_with_included_returns_included_list():
+    client = make_client(_FULL_REPORT)
+    report, included = asyncio.run(client.get_times_report_with_included("100"))
+    assert report.id == "100"
+    assert included == _FULL_REPORT["included"]
+
+
+def test_update_times_report_raises_on_silent_drop():
+    # Server returns 200 but persisted zero of the one entry sent.
+    report = TimesReport.model_validate(_FULL_REPORT["data"])
+    client = make_client(
+        {
+            "data": {
+                "id": "100",
+                "type": "timesreport",
+                "attributes": {
+                    "term": "2026-06",
+                    "state": "savedAndNoValidation",
+                    "regularTimes": [],
+                    "exceptionalTimes": [],
+                },
+            }
+        }
+    )
+    with pytest.raises(BoondManagerSilentDropError, match="regularTimes"):
+        asyncio.run(client.update_times_report(report))
+
+
+def test_get_resource_absences_reports_returns_periods():
+    client = make_client(
+        {
+            "data": [
+                {
+                    "id": "200",
+                    "type": "absencesreport",
+                    "attributes": {
+                        "state": "waitingForValidation",
+                        "absencesPeriods": [
+                            {
+                                "id": "1",
+                                "startDate": "2026-08-01",
+                                "endDate": "2026-08-05",
+                                "duration": 5.0,
+                                "title": "Congés payés",
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+    )
+    reports = asyncio.run(client.get_resource_absences_reports("42"))
+    assert reports[0].state == "waitingForValidation"
+    assert [(p.start_date, p.duration) for p in reports[0].periods] == [("2026-08-01", 5.0)]
+    assert client.last_call == ("GET", "/resources/42/absences-reports", None)
+
+
+def test_create_absences_report_posts_correct_body():
+    client = make_client(
+        {
+            "data": {
+                "id": "201",
+                "type": "absencesreport",
+                "attributes": {"state": "waitingForValidation"},
+            }
+        }
+    )
+    period = CreateAbsencePeriod(
+        start_date="2026-08-01",
+        end_date="2026-08-05",
+        duration=5.0,
+        title="Congés payés",
+        work_unit_type_reference=2,
+    )
+    report = asyncio.run(
+        client.create_absences_report("42", [period], comments="Vacances")
+    )
+    assert report.id == "201"
+    body = client.last_body["data"]
+    assert body["type"] == "absencesreport"
+    assert body["relationships"]["resource"]["data"] == {"id": "42", "type": "resource"}
+    assert body["attributes"]["informationComments"] == "Vacances"
+    assert body["attributes"]["absencesPeriods"] == [
+        {
+            "startDate": "2026-08-01",
+            "endDate": "2026-08-05",
+            "duration": 5.0,
+            "title": "Congés payés",
+            "workUnitType": {"reference": 2},
+        }
+    ]
+
+
+def test_create_absences_report_omits_comments_when_empty():
+    client = make_client(
+        {"data": {"id": "202", "type": "absencesreport", "attributes": {}}}
+    )
+    period = CreateAbsencePeriod(
+        start_date="2026-08-01",
+        end_date="2026-08-01",
+        duration=1.0,
+        title="RTT",
+        work_unit_type_reference=3,
+    )
+    asyncio.run(client.create_absences_report("42", [period]))
+    assert "informationComments" not in client.last_body["data"]["attributes"]
+
+
+def test_get_current_user():
+    client = make_client(
+        {
+            "data": {
+                "id": "9",
+                "type": "resource",
+                "attributes": {
+                    "firstName": "Paul",
+                    "lastName": "Mrabet",
+                    "login": "pm",
+                    "email1": "pm@lenstra.fr",
+                },
+            }
+        }
+    )
+    user = asyncio.run(client.get_current_user())
+    assert user.resource_id == "9"
+    assert user.full_name == "Paul Mrabet"
+    assert client.last_call == ("GET", "/application/current-user", None)
+
+
+def test_get_dictionary_returns_raw_response_untouched():
+    raw = {"data": {"id": "1", "attributes": {"setting": {"anything": True}}}}
+    client = make_client(raw)
+    assert asyncio.run(client.get_dictionary()) is raw
 
 
 # ---------------------------------------------------------------------------

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
+from datetime import date
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+logger = logging.getLogger(__name__)
 
 _CFG = ConfigDict(populate_by_name=True, extra="ignore")
 
@@ -391,6 +395,95 @@ class CreateAbsencePeriod(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Companies, positionings, projects
+# ---------------------------------------------------------------------------
+#
+# Flat models (no id/attributes split): their fields mix JSON:API attributes,
+# relationships, and included data, so client code assembles them from
+# Document/Entity navigation instead of validating a raw item directly.
+
+
+class Company(BaseModel):
+    model_config = _CFG
+
+    id: str
+    name: str = ""
+
+
+class _EmptyDateMixin:
+    """Shared before-validator for start_date/end_date: empty or unparseable
+    date strings become None instead of failing validation.
+
+    BoondManager occasionally sends a sentinel-like malformed date string for
+    "no date set" instead of omitting the field or sending "" (the only shape
+    handled by a plain falsy check). A genuinely different, non-date-shaped
+    payload still raises -- only date-shaped-but-unparseable strings degrade.
+    """
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _empty_date(cls, v):
+        if not v:
+            return None
+        if isinstance(v, str):
+            try:
+                date.fromisoformat(v)
+            except ValueError:
+                logger.warning("%s: unparseable date %r, coercing to None", cls.__name__, v)
+                return None
+        return v
+
+
+class Positioning(_EmptyDateMixin, BaseModel):
+    """A staffing assignment period for a resource.
+
+    Confirmed against a live instance (2026-07-10): a positioning has no
+    "project" relationship. It relates to an "opportunity" (and a "dependsOn"
+    back-reference to the resource itself), not directly to a project. To get
+    a resource's projects, use get_resource_projects() instead.
+    """
+
+    model_config = _CFG
+
+    id: str
+    start_date: date | None = Field(default=None, alias="startDate")
+    end_date: date | None = Field(default=None, alias="endDate")
+
+
+class ProjectSummary(BaseModel):
+    """Lightweight project as returned by list endpoints.
+
+    "title" is not populated by BoondManager on the live payloads checked
+    (2026-07-10): use "reference" as the display name.
+    """
+
+    model_config = _CFG
+
+    id: str
+    title: str | None = None
+    reference: str | None = None
+    state: int | str | None = None
+
+
+class Project(_EmptyDateMixin, BaseModel):
+    """Full project detail, with its client company when one is linked.
+
+    "title" and "state" are not populated by BoondManager on the live
+    payloads checked (2026-07-10): use "reference" as the display name.
+    """
+
+    model_config = _CFG
+
+    id: str
+    title: str | None = None
+    reference: str | None = None
+    state: int | str | None = None
+    start_date: date | None = Field(default=None, alias="startDate")
+    end_date: date | None = Field(default=None, alias="endDate")
+    company: Company | None = None
+
+
+# ---------------------------------------------------------------------------
 # Resources
 # ---------------------------------------------------------------------------
 
@@ -406,6 +499,29 @@ class ResourceAttributes(BaseModel):
     state: int | None = None
     type_of: int | None = Field(default=None, alias="typeOf")
     title: str | None = None
+    # Managers come from JSON:API relationships, not attributes, so
+    # model_validate never fills them: client.get_resource() resolves and
+    # assigns them (exactly one level deep — a manager's own managers stay
+    # None).
+    main_manager: Resource | None = Field(default=None, alias="mainManager")
+    hr_manager: Resource | None = Field(default=None, alias="hrManager")
+
+    @field_validator("main_manager", "hr_manager", mode="before")
+    @classmethod
+    def _tolerant_manager(cls, v):
+        # These fields only exist for the client to populate post-validation
+        # (see above); a caller passing raw "mainManager"/"hrManager" data
+        # through model_validate previously had it silently ignored
+        # (extra="ignore", no such field). Keep that behavior for anything
+        # that isn't already a resolved Resource, rather than a hard
+        # ValidationError.
+        if v is None or isinstance(v, Resource):
+            return v
+        try:
+            return Resource.model_validate(v)
+        except ValidationError:
+            logger.warning("%s: ignoring unresolvable manager value %r", cls.__name__, v)
+            return None
 
     @property
     def full_name(self) -> str:
@@ -427,6 +543,17 @@ class Resource(BaseModel):
     @property
     def full_name(self) -> str:
         return self.attributes.full_name
+
+    @property
+    def main_manager(self) -> Resource | None:
+        return self.attributes.main_manager
+
+    @property
+    def hr_manager(self) -> Resource | None:
+        return self.attributes.hr_manager
+
+
+ResourceAttributes.model_rebuild()
 
 
 # ---------------------------------------------------------------------------

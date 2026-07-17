@@ -36,6 +36,9 @@ async with BoondManagerClient(client_token=..., client_key=..., user_token=...) 
     # 2. Curated helpers returning pydantic models
     report = await client.get_times_report("1652")
     reports = await client.get_resource_times_reports(resource_id)
+    projects = await client.get_resource_projects(resource_id)  # use .reference, not .title
+    project = await client.get_project(projects[0].id)  # .company resolved
+    types = await client.get_resource_type_dictionary()  # label -> id, cached
 
     # 3. Full generated surface — one namespace per resource, every endpoint
     doc = await client.api.times_reports.search(params={"period": "2026-06"})
@@ -54,6 +57,21 @@ report = doc.one                       # Entity: report["term"], report.rel("pro
 for project in doc.included("project"):
     deliveries = doc.related(project, "deliveries")
 ```
+
+`get_resource()` and `search_resources_by_email()` always resolve the
+`mainManager`/`hrManager` relationships into full `Resource` objects,
+including their email (one level deep, so a manager's own managers stay
+`None`). Each manager can cost up to 2 extra GETs: one for the profile
+(skipped if present in the response's `included` data) and one to
+`/resources/{id}/information`, since the basic resource payload never
+carries emails — up to 4 extra GETs per resource, up to 4N for a search
+returning N results, though managers shared between results are only
+resolved once per call. A dangling manager reference or a failed email
+fetch (404) is logged and resolves to `None`/no email rather than failing
+the whole call. That resolution runs concurrently, so the client caps
+itself at 5 requests in flight at once by default — pass
+`max_concurrent_requests=` to change it, or `semaphore=` to share one limit
+across multiple client instances.
 
 `api.ENDPOINT_INDEX` maps `("PUT", "/times-reports/{id}")` to
 `("times_reports", "update")` for programmatic discovery, and
