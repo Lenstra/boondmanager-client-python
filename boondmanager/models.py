@@ -60,7 +60,7 @@ class TimeEntry(BaseModel):
 
     model_config = _CFG
 
-    id: str
+    id: str = ""  # absence entries of a pending request come without an id
     start_date: str = Field(alias="startDate")
     end_date: str | None = Field(default=None, alias="endDate")
     duration: float

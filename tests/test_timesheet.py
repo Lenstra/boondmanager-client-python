@@ -288,3 +288,17 @@ def test_drop_row_omits_entries_from_save():
     asyncio.run(ts.save())
     sent = client._state["puts"][1]
     assert sent["regularTimes"] == []
+
+
+def test_report_parses_absence_without_id():
+    # A fresh report with a pending absence request returns absencesTimes without an id.
+    from boondmanager.models import TimesReport
+
+    report = TimesReport.model_validate({
+        "id": "1", "type": "timesreport",
+        "attributes": {"term": "2026-01", "state": "savedAndNoValidation", "absencesTimes": [
+            {"startDate": "2026-01-15", "duration": 0.5,
+             "workUnitType": {"reference": 2, "activityType": "absence", "name": "CP"}},
+        ]},
+    })
+    assert report.absence_by_date() == {"2026-01-15": 0.5}
