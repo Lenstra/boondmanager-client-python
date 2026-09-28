@@ -1,0 +1,21 @@
+boondmanager/models.py
+  s_efa7b211a3813b::t_563a7bc8d5c013 63
+tests/test_timesheet.py
+  s_efa7b211a3813b::t_563a7bc8d5c013 291-304
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "af8270f9222b31da4fe957d189a89811b28311ea",
+  "prompts": {},
+  "sessions": {
+    "s_efa7b211a3813b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7f8a3c78-2ba6-42c0-9ab6-d4b2855e01bb",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
